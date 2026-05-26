@@ -1,0 +1,479 @@
+name: K8S Offline Bundle Builder & Deployer
+
+on:
+  workflow_dispatch:
+    inputs:
+      k8s_version:
+        description: 'Kubernetes 版本 (例: v1.28.2)'
+        required: true
+        default: 'v1.28.2'
+      arch:
+        description: '目标架构'
+        required: true
+        default: 'amd64'
+        type: choice
+        options:
+          - amd64
+          - arm64
+      cni_plugin:
+        description: '网络插件'
+        required: true
+        default: 'calico'
+        type: choice
+        options:
+          - calico
+          - flannel
+          - none
+      calico_version:
+        description: 'Calico 版本 (仅 calico 时有效)'
+        required: false
+        default: 'v3.27.0'
+      transfer_method:
+        description: '传输方式 (scp=直传 / oss=阿里云中转)'
+        required: true
+        default: 'scp'
+        type: choice
+        options:
+          - scp
+          - oss
+      install_after_transfer:
+        description: '传输完成后自动安装？'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+env:
+  K8S_VERSION: ${{ github.event.inputs.k8s_version }}
+  ARCH: ${{ github.event.inputs.arch }}
+  CNI_PLUGIN: ${{ github.event.inputs.cni_plugin }}
+  CALICO_VERSION: ${{ github.event.inputs.calico_version }}
+  BUNDLE_NAME: k8s-offline-${{ github.event.inputs.k8s_version }}-${{ github.event.inputs.arch }}.tar.gz
+  REMOTE_TMP: /tmp/k8s-offline-bundle
+
+jobs:
+
+  # ============================================================
+  # 阶段一：海外构建离线包
+  # ============================================================
+  build-offline-bundle:
+    name: "阶段一：海外构建离线包"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    outputs:
+      bundle_name: ${{ env.BUNDLE_NAME }}
+      bundle_size_mb: ${{ steps.bundle_info.outputs.size_mb }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 初始化目录
+        run: |
+          BUILD_DIR="$GITHUB_WORKSPACE/k8s-offline"
+          echo "BUILD_DIR=$BUILD_DIR" >> $GITHUB_ENV
+          mkdir -p "$BUILD_DIR"/{bin,images,cni,packages}
+          echo "目录已创建: $BUILD_DIR"
+
+      - name: 下载 kubeadm / kubectl / kubelet
+        run: |
+          BASE="https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/${ARCH}"
+          for bin in kubeadm kubectl kubelet; do
+            echo "下载 $bin ..."
+            curl -fsSL --retry 5 --retry-delay 3 \
+              "${BASE}/${bin}" -o "${BUILD_DIR}/bin/${bin}"
+            chmod +x "${BUILD_DIR}/bin/${bin}"
+            echo "完成: $(du -sh ${BUILD_DIR}/bin/${bin} | cut -f1)  $bin"
+          done
+
+          # kubelet.service 直接写入，不从网络下载
+          cat > "${BUILD_DIR}/bin/kubelet.service" <<'EOF'
+[Unit]
+Description=kubelet: The Kubernetes Node Agent
+Documentation=https://kubernetes.io/docs/
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/kubelet
+Restart=always
+StartLimitInterval=0
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+          # 10-kubeadm.conf 直接写入
+          cat > "${BUILD_DIR}/bin/10-kubeadm.conf" <<'EOF'
+[Service]
+Environment="KUBELET_KUBECONFIG_ARGS=--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
+Environment="KUBELET_CONFIG_ARGS=--config=/var/lib/kubelet/config.yaml"
+EnvironmentFile=-/var/lib/kubelet/kubeadm-flags.env
+EnvironmentFile=-/etc/default/kubelet
+ExecStart=
+ExecStart=/usr/local/bin/kubelet $KUBELET_KUBECONFIG_ARGS $KUBELET_CONFIG_ARGS $KUBELET_KUBEADM_ARGS $KUBELET_EXTRA_ARGS
+EOF
+          echo "kubelet.service 和 10-kubeadm.conf 已写入"
+
+      - name: 下载 containerd / runc / crictl
+        run: |
+          CONTAINERD_VERSION="1.7.13"
+          RUNC_VERSION="v1.1.12"
+          CRICTL_VERSION="v1.29.0"
+
+          echo "下载 containerd v${CONTAINERD_VERSION} ..."
+          curl -fsSL --retry 5 \
+            "https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-${ARCH}.tar.gz" \
+            -o "${BUILD_DIR}/bin/containerd.tar.gz"
+
+          echo "下载 runc ${RUNC_VERSION} ..."
+          curl -fsSL --retry 5 \
+            "https://github.com/opencontainers/runc/releases/download/${RUNC_VERSION}/runc.${ARCH}" \
+            -o "${BUILD_DIR}/bin/runc"
+          chmod +x "${BUILD_DIR}/bin/runc"
+
+          echo "下载 crictl ${CRICTL_VERSION} ..."
+          curl -fsSL --retry 5 \
+            "https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-${ARCH}.tar.gz" \
+            -o "${BUILD_DIR}/bin/crictl.tar.gz"
+
+          echo "containerd / runc / crictl 下载完成"
+
+      - name: 拉取并导出 K8S 核心镜像
+        run: |
+          chmod +x "${BUILD_DIR}/bin/kubeadm"
+
+          echo "获取 ${K8S_VERSION} 镜像列表..."
+          IMAGE_LIST=$("${BUILD_DIR}/bin/kubeadm" config images list \
+            --kubernetes-version="${K8S_VERSION}" 2>/dev/null)
+          echo "$IMAGE_LIST"
+          echo "共 $(echo "$IMAGE_LIST" | wc -l) 个镜像"
+
+          while IFS= read -r image; do
+            [ -z "$image" ] && continue
+            safe=$(echo "$image" | sed 's|[/:]|_|g')
+            echo "拉取: $image"
+            docker pull "$image" --platform "linux/${ARCH}"
+            docker save "$image" -o "${BUILD_DIR}/images/${safe}.tar"
+            echo "已保存: $(du -sh ${BUILD_DIR}/images/${safe}.tar | cut -f1)  ${safe}.tar"
+          done <<< "$IMAGE_LIST"
+
+      - name: 下载 CNI 插件
+        if: ${{ github.event.inputs.cni_plugin != 'none' }}
+        run: |
+          case "$CNI_PLUGIN" in
+            calico)
+              echo "下载 Calico ${CALICO_VERSION} ..."
+              curl -fsSL --retry 5 \
+                "https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/calico.yaml" \
+                -o "${BUILD_DIR}/cni/calico.yaml"
+              for img in \
+                "docker.io/calico/cni:${CALICO_VERSION}" \
+                "docker.io/calico/node:${CALICO_VERSION}" \
+                "docker.io/calico/kube-controllers:${CALICO_VERSION}"; do
+                safe=$(echo "$img" | sed 's|[/:]|_|g')
+                docker pull "$img" --platform "linux/${ARCH}"
+                docker save "$img" -o "${BUILD_DIR}/images/${safe}.tar"
+              done
+              ;;
+            flannel)
+              FLANNEL_VER="v0.24.2"
+              echo "下载 Flannel ${FLANNEL_VER} ..."
+              curl -fsSL --retry 5 \
+                "https://github.com/flannel-io/flannel/releases/download/${FLANNEL_VER}/kube-flannel.yml" \
+                -o "${BUILD_DIR}/cni/flannel.yaml"
+              docker pull "docker.io/flannel/flannel:${FLANNEL_VER}" --platform "linux/${ARCH}"
+              docker save "docker.io/flannel/flannel:${FLANNEL_VER}" \
+                -o "${BUILD_DIR}/images/flannel_${FLANNEL_VER}.tar"
+              ;;
+          esac
+          echo "CNI 插件处理完成"
+
+      - name: 下载系统依赖 deb 包
+        run: |
+          sudo apt-get update -qq
+          cd "${BUILD_DIR}/packages"
+          for pkg in socat conntrack ipset ipvsadm; do
+            echo "下载 deb: $pkg"
+            apt-get download "$pkg" 2>/dev/null || true
+          done
+          echo "系统依赖包:"
+          ls -lh "${BUILD_DIR}/packages/" || echo "(无)"
+
+      - name: 写入 bundle.env 与安装脚本
+        run: |
+          cat > "${BUILD_DIR}/bundle.env" <<EOF
+K8S_VERSION=${K8S_VERSION}
+ARCH=${ARCH}
+CNI_PLUGIN=${CNI_PLUGIN}
+CALICO_VERSION=${CALICO_VERSION}
+BUILD_TIME=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+EOF
+          echo "bundle.env 已写入"
+
+          if [ -f "scripts/install-k8s-offline.sh" ]; then
+            cp scripts/install-k8s-offline.sh "${BUILD_DIR}/install.sh"
+            chmod +x "${BUILD_DIR}/install.sh"
+            echo "install.sh 已注入"
+          fi
+
+      - name: 打包压缩
+        run: |
+          echo "目录大小统计:"
+          du -sh "${BUILD_DIR}"/*/
+          sudo apt-get install -y pigz -qq
+          cd "$GITHUB_WORKSPACE"
+          tar -I pigz -cf "${BUNDLE_NAME}" k8s-offline/
+          echo "打包完成: $(du -sh ${BUNDLE_NAME} | cut -f1)  ${BUNDLE_NAME}"
+
+      - name: 输出包信息
+        id: bundle_info
+        run: |
+          SIZE_MB=$(du -m "${BUNDLE_NAME}" | cut -f1)
+          echo "size_mb=${SIZE_MB}" >> $GITHUB_OUTPUT
+          echo "离线包大小: ${SIZE_MB} MB"
+          echo "预计传输时间 @  1Mbps: $((SIZE_MB * 8 / 60)) 分钟"
+          echo "预计传输时间 @ 10Mbps: $((SIZE_MB * 8 / 10 / 60)) 分钟"
+          echo "预计传输时间 @100Mbps: $((SIZE_MB * 8 / 100 / 60 + 1)) 分钟"
+
+      - name: 上传 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BUNDLE_NAME }}
+          path: ${{ env.BUNDLE_NAME }}
+          retention-days: 3
+
+  # ============================================================
+  # 阶段二-A：SCP 直接传输
+  # ============================================================
+  transfer-via-scp:
+    name: "阶段二-SCP：跨境传输"
+    runs-on: ubuntu-22.04
+    needs: build-offline-bundle
+    timeout-minutes: 300
+    if: ${{ github.event.inputs.transfer_method == 'scp' }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 下载 Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build-offline-bundle.outputs.bundle_name }}
+
+      - name: 配置 SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          cat > ~/.ssh/config <<'EOF'
+Host *
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  ServerAliveInterval 60
+  ServerAliveCountMax 10
+  ConnectTimeout 30
+EOF
+
+      - name: rsync 传输（支持断点续传）
+        run: |
+          BUNDLE="${{ needs.build-offline-bundle.outputs.bundle_name }}"
+          SSH_USER="${{ secrets.SSH_USER }}"
+          REMOTE_DIR="${{ env.REMOTE_TMP }}"
+
+          if [ ! -f "hosts.txt" ]; then
+            echo "未找到 hosts.txt"
+            exit 1
+          fi
+
+          HOSTS=$(grep -v '^\s*#' hosts.txt | grep -v '^\s*$')
+          echo "目标服务器: $(echo "$HOSTS" | wc -l) 台"
+          echo "文件大小: $(du -sh $BUNDLE | cut -f1)"
+
+          while IFS= read -r host; do
+            [ -z "$host" ] && continue
+            echo "=== [$host] 开始传输 ==="
+            ssh -i ~/.ssh/deploy_key "${SSH_USER}@${host}" "mkdir -p ${REMOTE_DIR}"
+
+            for attempt in 1 2 3; do
+              rsync -az --progress --partial \
+                -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no" \
+                "$BUNDLE" "${SSH_USER}@${host}:${REMOTE_DIR}/" \
+                && echo "[$host] 传输成功" && break \
+                || echo "[$host] 第 ${attempt}/3 次失败，等待重试..." && sleep 30
+            done
+          done <<< "$HOSTS"
+
+      - name: 推送安装脚本
+        run: |
+          SSH_USER="${{ secrets.SSH_USER }}"
+          HOSTS=$(grep -v '^\s*#' hosts.txt | grep -v '^\s*$')
+          while IFS= read -r host; do
+            [ -z "$host" ] && continue
+            scp -i ~/.ssh/deploy_key \
+              scripts/install-k8s-offline.sh \
+              "${SSH_USER}@${host}:${{ env.REMOTE_TMP }}/install.sh"
+            ssh -i ~/.ssh/deploy_key "${SSH_USER}@${host}" \
+              "chmod +x ${{ env.REMOTE_TMP }}/install.sh && echo [$host] install.sh 就绪"
+          done <<< "$HOSTS"
+
+  # ============================================================
+  # 阶段二-B：OSS 中转
+  # ============================================================
+  transfer-via-oss:
+    name: "阶段二-OSS：中转下载"
+    runs-on: ubuntu-22.04
+    needs: build-offline-bundle
+    timeout-minutes: 60
+    if: ${{ github.event.inputs.transfer_method == 'oss' }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 下载 Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build-offline-bundle.outputs.bundle_name }}
+
+      - name: 安装 ossutil
+        run: |
+          curl -fsSL \
+            "https://github.com/aliyun/ossutil/releases/download/v1.7.19/ossutil-v1.7.19-linux-amd64.zip" \
+            -o ossutil.zip
+          unzip -q ossutil.zip
+          sudo mv ossutil-v1.7.19-linux-amd64/ossutil /usr/local/bin/ossutil
+          sudo chmod +x /usr/local/bin/ossutil
+          ossutil config \
+            -e "${{ secrets.OSS_ENDPOINT }}" \
+            -i "${{ secrets.OSS_ACCESS_KEY_ID }}" \
+            -k "${{ secrets.OSS_ACCESS_KEY_SECRET }}" \
+            -L CH
+
+      - name: 上传到 OSS
+        run: |
+          BUNDLE="${{ needs.build-offline-bundle.outputs.bundle_name }}"
+          OSS_PATH="oss://${{ secrets.OSS_BUCKET }}/k8s-offline/${BUNDLE}"
+          ossutil cp "$BUNDLE" "$OSS_PATH" --jobs 8
+          SIGN_URL=$(ossutil sign "$OSS_PATH" --timeout 10800 2>/dev/null \
+            | grep "^https\?://" | head -1)
+          echo "下载链接(3h有效): $SIGN_URL"
+          echo "OSS_DOWNLOAD_URL=$SIGN_URL" >> $GITHUB_ENV
+
+      - name: 配置 SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          cat > ~/.ssh/config <<'EOF'
+Host *
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  ServerAliveInterval 60
+EOF
+
+      - name: 通知服务器从 OSS 下载
+        run: |
+          SSH_USER="${{ secrets.SSH_USER }}"
+          BUNDLE="${{ needs.build-offline-bundle.outputs.bundle_name }}"
+          HOSTS=$(grep -v '^\s*#' hosts.txt | grep -v '^\s*$')
+          while IFS= read -r host; do
+            [ -z "$host" ] && continue
+            echo "=== [$host] 触发 OSS 下载 ==="
+            ssh -i ~/.ssh/deploy_key "${SSH_USER}@${host}" \
+              "mkdir -p ${{ env.REMOTE_TMP }} && \
+               cd ${{ env.REMOTE_TMP }} && \
+               wget -c --tries=5 --timeout=60 \
+                 '${{ env.OSS_DOWNLOAD_URL }}' \
+                 -O '${BUNDLE}' && \
+               echo [$host] 下载完成"
+          done <<< "$HOSTS"
+
+      - name: 推送安装脚本
+        run: |
+          SSH_USER="${{ secrets.SSH_USER }}"
+          HOSTS=$(grep -v '^\s*#' hosts.txt | grep -v '^\s*$')
+          while IFS= read -r host; do
+            [ -z "$host" ] && continue
+            scp -i ~/.ssh/deploy_key \
+              scripts/install-k8s-offline.sh \
+              "${SSH_USER}@${host}:${{ env.REMOTE_TMP }}/install.sh"
+            ssh -i ~/.ssh/deploy_key "${SSH_USER}@${host}" \
+              "chmod +x ${{ env.REMOTE_TMP }}/install.sh"
+          done <<< "$HOSTS"
+
+  # ============================================================
+  # 阶段三：触发国内服务器安装
+  # ============================================================
+  install-on-servers:
+    name: "阶段三：国内服务器安装"
+    runs-on: ubuntu-22.04
+    needs:
+      - build-offline-bundle
+      - transfer-via-scp
+      - transfer-via-oss
+    if: |
+      always() &&
+      github.event.inputs.install_after_transfer == 'true' &&
+      (needs.transfer-via-scp.result == 'success' || needs.transfer-via-oss.result == 'success')
+    timeout-minutes: 60
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          cat > ~/.ssh/config <<'EOF'
+Host *
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  ServerAliveInterval 60
+  ServerAliveCountMax 20
+EOF
+
+      - name: 触发安装
+        run: |
+          SSH_USER="${{ secrets.SSH_USER }}"
+          BUNDLE="${{ needs.build-offline-bundle.outputs.bundle_name }}"
+          HOSTS=$(grep -v '^\s*#' hosts.txt | grep -v '^\s*$')
+          while IFS= read -r host; do
+            [ -z "$host" ] && continue
+            echo "=== [$host] 开始安装 ==="
+            ssh -i ~/.ssh/deploy_key "${SSH_USER}@${host}" \
+              "cd ${{ env.REMOTE_TMP }} && \
+               bash install.sh --bundle '${BUNDLE}' 2>&1 | tee install.log" \
+              && echo "[$host] 安装完成" \
+              || echo "[$host] 安装失败，查看 ${{ env.REMOTE_TMP }}/install.log"
+          done <<< "$HOSTS"
+
+      - name: 收集日志与集群状态
+        if: always()
+        run: |
+          SSH_USER="${{ secrets.SSH_USER }}"
+          HOSTS=$(grep -v '^\s*#' hosts.txt | grep -v '^\s*$')
+          mkdir -p install-logs
+          while IFS= read -r host; do
+            [ -z "$host" ] && continue
+            echo "=== [$host] ==="
+            scp -i ~/.ssh/deploy_key \
+              "${SSH_USER}@${host}:${{ env.REMOTE_TMP }}/install.log" \
+              "install-logs/${host}.log" 2>/dev/null || echo "日志收集失败"
+            ssh -i ~/.ssh/deploy_key "${SSH_USER}@${host}" \
+              "kubectl get nodes -o wide 2>/dev/null || echo '节点未就绪'" || true
+          done <<< "$HOSTS"
+
+      - name: 上传安装日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-logs-${{ github.run_id }}
+          path: install-logs/
+          retention-days: 7
